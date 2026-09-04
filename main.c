@@ -43,7 +43,7 @@ typedef struct ConnectionState {
 ConnectionState* create_connection_state__(int fd, fd_type_t type, ConnectionState* partner, uint8_t request_buffer[2048], ssize_t request_len);
 void free_connection_state__(ConnectionState* connection_state);
 void handle_new_connection__(int server_fd, int epoll_fd, struct epoll_event* ev);
-void handle_browser_event__(ConnectionState* active_state, int epoll_fd, uint32_t events, uint8_t request_buffer[2048], const char *target_port, int *current_backend, struct epoll_event* ev);
+void handle_browser_event__(ConnectionState* active_state, int epoll_fd, uint32_t events, uint8_t request_buffer[2048], struct epoll_event* ev);
 void handle_backend_event__(ConnectionState* active_state, int epoll_fd, uint32_t events, uint8_t* request_buffer, struct epoll_event* ev);
 
 // FUNCTIONS
@@ -117,8 +117,6 @@ void handle_browser_event__(
     int epoll_fd,
     const uint32_t events,
     uint8_t request_buffer[2048],
-    const char *target_port,
-    int *current_backend,
     struct epoll_event* ev) {
 
     if (events & EPOLLIN) {
@@ -128,9 +126,27 @@ void handle_browser_event__(
             return;
         }
 
+        // parse HTTP request
+        char method[256] = {0};
+        char path[1024] = {0};
+        parse_http_request__(request_buffer, method, path);
+
+        printf("Browser request METHOD: %s | PATH: %s\n", method, path);
+
         if (active_state->partner == NULL) {
+            const char* target_port;
+
+            if (strncmp(path, "/hello", 6) == 0) {
+                target_port = backend_ports[0]; // port 9000
+            } else if (strncmp(path, "/goodbye", 8) == 0) {
+                target_port = backend_ports[1]; // port 9001
+            } else {
+                target_port = backend_ports[0]; // port 9000
+            }
+
+            printf("Routing traffic to PORT: %s\n", target_port);
+
             const int backend_fd = connect_to_backend(BACKEND_IP, target_port);
-            *current_backend = (*current_backend + 1) % num_backends;
 
             ConnectionState* backend_state =
                 create_connection_state__(backend_fd, TYPE_BACKEND, active_state, request_buffer, bytes_received);
@@ -174,8 +190,7 @@ void handle_backend_event__(
 }
 
 int main(void) {
-    int server_fd, current_backend = 0, epoll_fd, epoll_ctl_, nfds, n;
-    char *target_port;
+    int server_fd, epoll_fd, epoll_ctl_, nfds, n;
     uint8_t request_buffer[2048];
     struct epoll_event ev, events[MAX_EVENTS];
 
@@ -216,20 +231,15 @@ int main(void) {
         }
 
         for (n = 0; n < nfds; ++n) {
-            // load balance between Java apps
-            target_port = backend_ports[current_backend];
             ConnectionState *active_state = (ConnectionState *) events[n].data.ptr;
 
             if (active_state->type == TYPE_SERVER) {
                 handle_new_connection__(server_fd, epoll_fd, &ev);
             } else if (active_state->type == TYPE_BROWSER) {
-                handle_browser_event__(active_state, epoll_fd, events[n].events, request_buffer, target_port, &current_backend, &ev);
+                handle_browser_event__(active_state, epoll_fd, events[n].events, request_buffer, &ev);
             } else if (active_state->type == TYPE_BACKEND) {
                 handle_backend_event__(active_state, epoll_fd, events[n].events, request_buffer, &ev);
             }
         }
     }
-
-    close(server_fd);
-    return 0;
 }

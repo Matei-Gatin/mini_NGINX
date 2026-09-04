@@ -29,6 +29,13 @@ int set_non_blocking__(const int sock_fd) {
 }
 
 /*
+ * Helper function to parse the HTTP request
+ */
+void parse_http_request__(const uint8_t* buffer, char* method, char* path) {
+    sscanf((const char*) buffer, "%255s %1023s", method, path);
+}
+
+/*
  * creates the server socket or returns -1 if fails
  */
 int create_server_socket(const char *port) {
