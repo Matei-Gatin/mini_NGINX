@@ -8,12 +8,25 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <errno.h>
 
 //
 #include "../include/proxy.h"
 
 //
 #define BACKLOCK 10
+
+/*
+ * Helper function to set sockets to non-blocking
+*/
+int set_non_blocking__(const int sock_fd) {
+    if (fcntl(sock_fd, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fnctl failed");
+        close(sock_fd);
+        return -1;
+    }
+    return 1;
+}
 
 /*
  * creates the server socket or returns -1 if fails
@@ -103,10 +116,15 @@ int connect_to_backend(const char *backend_ip, const char *backend_port) {
             continue;
         }
 
+        // make the sock_fd non-blocking
+        set_non_blocking__(sock_fd);
+
         if (connect(sock_fd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sock_fd);
-            perror("client: connect");
-            continue;
+            if (errno != EINPROGRESS){
+                close(sock_fd);
+                perror("client: connect");
+                continue;
+            }
         }
 
         break;

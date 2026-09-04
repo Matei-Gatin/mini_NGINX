@@ -11,7 +11,7 @@
 #include <sys/epoll.h>
 
 //
-#include <fcntl.h>
+#include <string.h>
 
 #include "./include/proxy.h"
 
@@ -21,9 +21,8 @@
 #define MAX_EVENTS 10
 
 // PROTOTYPES
-void pass_data(int client_fd, int backend_fd);
 
-const char *backend_ports[] = {"9000", "9001"};
+char *backend_ports[] = {"9000", "9001"};
 const int num_backends = 2;
 
 typedef enum {
@@ -36,21 +35,144 @@ typedef struct ConnectionState {
     int fd;
     fd_type_t type;
     struct ConnectionState *partner;
+
+    uint8_t pending_data[2048];
+    ssize_t pending_len;
 } ConnectionState;
 
-// HELPER FUNCTIONS
-int set_non_blocking__(const int sock_fd) {
-    // set the socket to non-blocking mode
-    if (fcntl(sock_fd, F_SETFL, O_NONBLOCK) < 0) {
-        perror("fnctl failed");
-        close(sock_fd);
-        return -1;
-    }
-
-    return 1;
-}
+ConnectionState* create_connection_state__(int fd, fd_type_t type, ConnectionState* partner, uint8_t request_buffer[2048], ssize_t request_len);
+void free_connection_state__(ConnectionState* connection_state);
+void handle_new_connection__(int server_fd, int epoll_fd, struct epoll_event* ev);
+void handle_browser_event__(ConnectionState* active_state, int epoll_fd, uint32_t events, uint8_t request_buffer[2048], const char *target_port, int *current_backend, struct epoll_event* ev);
+void handle_backend_event__(ConnectionState* active_state, int epoll_fd, uint32_t events, uint8_t* request_buffer, struct epoll_event* ev);
 
 // FUNCTIONS
+ConnectionState* create_connection_state__(int fd, fd_type_t type, ConnectionState* partner, uint8_t request_buffer[2048], ssize_t request_len) {
+    ConnectionState* connection_state = (ConnectionState *) malloc(sizeof(struct ConnectionState));
+    if (connection_state == NULL) return NULL;
+
+    connection_state->fd = fd;
+    connection_state->type = type;
+    connection_state->partner = partner;
+
+    if (request_len > 0) {
+        memcpy(connection_state->pending_data, request_buffer, request_len);
+    }
+
+    connection_state->pending_len = request_len;
+
+    return connection_state;
+}
+
+void free_connection_state__(ConnectionState* connection_state) {
+    if (connection_state == NULL) return;
+
+    close(connection_state->fd);
+
+    if (connection_state->partner != NULL) {
+        close(connection_state->partner->fd);
+        free(connection_state->partner);
+    }
+
+    free(connection_state);
+}
+
+void handle_new_connection__(
+    const int server_fd,
+    const int epoll_fd,
+    struct epoll_event* ev) {
+
+    const int client_fd = accept(server_fd, NULL, NULL);
+
+    if (client_fd == -1) {
+        perror("Failed to accept");
+        return;
+    }
+
+    printf("Browser connected! Forwarding to backend...\n");
+
+    if (set_non_blocking__(client_fd) == -1) {
+        return;
+    }
+
+    ConnectionState* browser_state = create_connection_state__(client_fd, TYPE_BROWSER, NULL, 0, 0);
+    if (browser_state == NULL) {
+        perror("create_connection_state__: browser_state");
+        close(client_fd);
+        return;
+    }
+
+    ev->events = EPOLLIN;
+    ev->data.ptr = browser_state;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, ev) == -1) {
+        perror("epoll_ctl: client_fd");
+        close(client_fd);
+        free(browser_state);
+    }
+}
+
+void handle_browser_event__(
+    ConnectionState* active_state,
+    int epoll_fd,
+    const uint32_t events,
+    uint8_t request_buffer[2048],
+    const char *target_port,
+    int *current_backend,
+    struct epoll_event* ev) {
+
+    if (events & EPOLLIN) {
+        const ssize_t bytes_received = recv(active_state->fd, request_buffer, 2048, 0);
+        if (bytes_received <= 0) {
+            free_connection_state__(active_state);
+            return;
+        }
+
+        if (active_state->partner == NULL) {
+            const int backend_fd = connect_to_backend(BACKEND_IP, target_port);
+            *current_backend = (*current_backend + 1) % num_backends;
+
+            ConnectionState* backend_state =
+                create_connection_state__(backend_fd, TYPE_BACKEND, active_state, request_buffer, bytes_received);
+
+            active_state->partner = backend_state;
+
+            ev->events = EPOLLOUT;
+            ev->data.ptr = backend_state;
+            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, backend_fd, ev);
+        } else {
+            send(active_state->partner->fd, request_buffer, bytes_received, 0);
+        }
+    }
+}
+
+void handle_backend_event__(
+    ConnectionState* active_state,
+    int epoll_fd,
+    const uint32_t events,
+    uint8_t* request_buffer,
+    struct epoll_event* ev) {
+
+    if (events & EPOLLIN) {
+        const ssize_t bytes_received = recv(active_state->fd, request_buffer, 2048, 0);
+
+        if (bytes_received <= 0) {
+            free_connection_state__(active_state);
+            return;
+        }
+
+        send(active_state->partner->fd, request_buffer, bytes_received, 0);
+    }
+
+    else if (events & EPOLLOUT) {
+        send(active_state->fd, active_state->pending_data, active_state->pending_len, 0);
+
+        ev->events = EPOLLIN;
+        ev->data.ptr = active_state;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, active_state->fd, ev);
+    }
+}
+
 int main(void) {
     int server_fd, current_backend = 0, epoll_fd, epoll_ctl_, nfds, n;
     char *target_port;
@@ -60,7 +182,6 @@ int main(void) {
     signal(SIGCHLD, SIG_IGN);
 
     server_fd = create_server_socket(PROXY_PORT);
-
     if (server_fd == -1) {
         return EXIT_FAILURE;
     }
@@ -73,10 +194,11 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    ConnectionState *server_state = (struct ConnectionState*) malloc(sizeof(struct ConnectionState));
-    server_state->fd = server_fd;
-    server_state->type = TYPE_SERVER;
-    server_state->partner = NULL;
+    ConnectionState *server_state = create_connection_state__(server_fd, TYPE_SERVER, NULL, 0, 0);
+    if (server_state == NULL) {
+        perror("create_connection_state__: server_state");
+        return EXIT_FAILURE;
+    }
 
     ev.events = EPOLLIN;
     ev.data.ptr = server_state;
@@ -96,72 +218,14 @@ int main(void) {
         for (n = 0; n < nfds; ++n) {
             // load balance between Java apps
             target_port = backend_ports[current_backend];
-
             ConnectionState *active_state = (ConnectionState *) events[n].data.ptr;
 
             if (active_state->type == TYPE_SERVER) {
-                const int client_fd = accept(server_fd, NULL, NULL);
-
-                if (client_fd == -1) {
-                    perror("Failed to accept");
-                    continue;
-                }
-
-                printf("Browser connected! Forwarding to backend...\n");
-
-                if (set_non_blocking__(client_fd) == -1) {
-                    continue;
-                }
-
-                ConnectionState *browser_state = (struct ConnectionState*) malloc(sizeof(struct ConnectionState));
-                browser_state->fd = client_fd;
-                browser_state->type = TYPE_BROWSER;
-                browser_state->partner = NULL;
-
-                ev.events = EPOLLIN;
-                ev.data.ptr = browser_state;
-
-                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
-                    perror("epoll_ctl: client_fd");
-                    close(client_fd);
-                }
-            } else {
-                const ssize_t bytes_received = recv(active_state->fd, request_buffer, sizeof(request_buffer), 0);
-                if (bytes_received <= 0) {
-                    close(active_state->fd);
-                    if (active_state->partner != NULL) {
-                        close(active_state->partner->fd);
-                        free(active_state->partner);
-                    }
-
-                    free(active_state);
-                    continue;
-                }
-
-                if (active_state->type == TYPE_BROWSER) {
-                    if (active_state->partner == NULL) {
-                        const int backend_fd = connect_to_backend(BACKEND_IP, target_port);
-                        current_backend = (current_backend + 1) % num_backends;
-                        set_non_blocking__(backend_fd);
-
-                        ConnectionState *backend_state = malloc(sizeof(ConnectionState));
-                        backend_state->fd = backend_fd;
-                        backend_state->type = TYPE_BACKEND;
-                        backend_state->partner = active_state;
-
-                        active_state->partner = backend_state;
-
-                        send(backend_fd, request_buffer, bytes_received, 0);
-
-                        ev.events = EPOLLIN;
-                        ev.data.ptr = backend_state;
-                        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, backend_fd, &ev);
-                    } else {
-                        send(active_state->partner->fd, request_buffer, bytes_received, 0);
-                    }
-                } else if (active_state->type == TYPE_BACKEND) {
-                    send(active_state->partner->fd, request_buffer, bytes_received, 0);
-                }
+                handle_new_connection__(server_fd, epoll_fd, &ev);
+            } else if (active_state->type == TYPE_BROWSER) {
+                handle_browser_event__(active_state, epoll_fd, events[n].events, request_buffer, target_port, &current_backend, &ev);
+            } else if (active_state->type == TYPE_BACKEND) {
+                handle_backend_event__(active_state, epoll_fd, events[n].events, request_buffer, &ev);
             }
         }
     }
